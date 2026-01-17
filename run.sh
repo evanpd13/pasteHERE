@@ -15,4 +15,4 @@ else
 fi
 
 echo "Starting Zero-1-to-3 Novel View Synthesis..."
-python app.py
+python app.py "$@"
