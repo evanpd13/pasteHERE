@@ -4,37 +4,76 @@ Zero-1-to-3 Novel View Synthesis App
 Generates ±30° rotated views from a single image using Stable Zero123.
 """
 
+import argparse
+import contextlib
+import io
+import logging
 import os
 import sys
 import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+import imageio
+import numpy as np
+import torch
+from PIL import Image, ImageOps
+from rembg import remove
+import gradio as gr
 
 # Add current directory to path for pipeline import
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import io
-import torch
-import numpy as np
-from PIL import Image
-from pathlib import Path
-from rembg import remove
-import gradio as gr
-import imageio
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+LOGGER = logging.getLogger("zero123")
 
-# Determine device
-if torch.backends.mps.is_available():
-    DEVICE = "mps"
-    DTYPE = torch.float32  # MPS works better with float32
-elif torch.cuda.is_available():
-    DEVICE = "cuda"
-    DTYPE = torch.float16
-else:
-    DEVICE = "cpu"
-    DTYPE = torch.float32
+DEFAULT_MODEL_ID = "kxic/stable-zero123"
+DEFAULT_IMAGE_SIZE = 256
 
-print(f"Using device: {DEVICE}")
+
+def resolve_device(preferred: str | None = None) -> tuple[str, torch.dtype]:
+    """Resolve device and dtype from preference and hardware availability."""
+    if preferred:
+        preferred = preferred.lower()
+        if preferred == "cuda" and torch.cuda.is_available():
+            return "cuda", torch.float16
+        if preferred == "mps" and torch.backends.mps.is_available():
+            return "mps", torch.float32
+        if preferred == "cpu":
+            return "cpu", torch.float32
+        LOGGER.warning("Requested device '%s' unavailable; falling back to auto.", preferred)
+
+    if torch.backends.mps.is_available():
+        return "mps", torch.float32
+    if torch.cuda.is_available():
+        return "cuda", torch.float16
+    return "cpu", torch.float32
+
+
+DEVICE, DTYPE = resolve_device(os.getenv("ZERO123_DEVICE"))
+
+LOGGER.info("Using device: %s", DEVICE)
+
+@dataclass(frozen=True)
+class AppConfig:
+    model_id: str = DEFAULT_MODEL_ID
+    image_size: int = DEFAULT_IMAGE_SIZE
+
 
 # Global pipeline (loaded once)
 PIPELINE = None
+PIPELINE_CONFIG = AppConfig()
+
+
+def maybe_enable_xformers(pipe) -> None:
+    """Enable xFormers if available."""
+    if DEVICE != "cuda":
+        return
+    try:
+        pipe.enable_xformers_memory_efficient_attention()
+        LOGGER.info("Enabled xFormers memory efficient attention.")
+    except Exception as exc:
+        LOGGER.warning("xFormers not available: %s", exc)
 
 
 def load_pipeline():
@@ -43,31 +82,31 @@ def load_pipeline():
     if PIPELINE is not None:
         return PIPELINE
 
-    print("Loading Stable Zero123 pipeline...")
+    LOGGER.info("Loading Stable Zero123 pipeline...")
 
     from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
     from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
     from pipeline_zero1to3 import Zero1to3StableDiffusionPipeline, CCProjection
 
-    model_id = "kxic/stable-zero123"
+    model_id = PIPELINE_CONFIG.model_id
 
     # Load each component separately
-    print("  Loading VAE...")
+    LOGGER.info("  Loading VAE...")
     vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae", torch_dtype=DTYPE)
 
-    print("  Loading image encoder...")
+    LOGGER.info("  Loading image encoder...")
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(model_id, subfolder="image_encoder", torch_dtype=DTYPE)
 
-    print("  Loading feature extractor...")
+    LOGGER.info("  Loading feature extractor...")
     feature_extractor = CLIPImageProcessor.from_pretrained(model_id, subfolder="feature_extractor")
 
-    print("  Loading UNet...")
+    LOGGER.info("  Loading UNet...")
     unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet", torch_dtype=DTYPE)
 
-    print("  Loading scheduler...")
+    LOGGER.info("  Loading scheduler...")
     scheduler = DDIMScheduler.from_pretrained(model_id, subfolder="scheduler")
 
-    print("  Loading CC projection...")
+    LOGGER.info("  Loading CC projection...")
     cc_projection = CCProjection.from_pretrained(model_id, subfolder="cc_projection")
 
     # Assemble the pipeline
@@ -84,8 +123,10 @@ def load_pipeline():
 
     PIPELINE = PIPELINE.to(DEVICE)
     PIPELINE.enable_attention_slicing()
+    PIPELINE.enable_vae_slicing()
+    maybe_enable_xformers(PIPELINE)
 
-    print("Pipeline loaded successfully!")
+    LOGGER.info("Pipeline loaded successfully!")
     return PIPELINE
 
 
@@ -97,24 +138,33 @@ def remove_background(image: Image.Image) -> Image.Image:
     return output
 
 
-def preprocess_image(image: Image.Image, size: int = 256) -> Image.Image:
-    """Preprocess image for Zero123: resize, center, add white background."""
-    # Remove background first
-    image = remove_background(image)
+def preprocess_image(
+    image: Image.Image,
+    size: int = DEFAULT_IMAGE_SIZE,
+    remove_bg: bool = True,
+    background_color: tuple[int, int, int] = (255, 255, 255),
+) -> Image.Image:
+    """Preprocess image for Zero123: resize, center, add background."""
+    image = ImageOps.exif_transpose(image)
+    if remove_bg:
+        image = remove_background(image)
 
     # Get the bounding box of non-transparent pixels
-    bbox = image.getbbox()
-    if bbox:
-        image = image.crop(bbox)
+    if image.mode == "RGBA":
+        bbox = image.getbbox()
+        if bbox:
+            image = image.crop(bbox)
 
     # Resize while maintaining aspect ratio
     w, h = image.size
+    if w == 0 or h == 0:
+        raise ValueError("Invalid image size after preprocessing.")
     scale = min(size / w, size / h) * 0.8  # 80% to leave margin
-    new_w, new_h = int(w * scale), int(h * scale)
+    new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
     image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
     # Create white background and paste centered
-    result = Image.new("RGB", (size, size), (255, 255, 255))
+    result = Image.new("RGB", (size, size), background_color)
     paste_x = (size - new_w) // 2
     paste_y = (size - new_h) // 2
 
@@ -126,8 +176,30 @@ def preprocess_image(image: Image.Image, size: int = 256) -> Image.Image:
     return result
 
 
-def generate_novel_view(processed_image: Image.Image, azimuth: float, polar: float = 0,
-                        num_steps: int = 75, guidance: float = 3.0) -> Image.Image:
+def inference_autocast():
+    """Return an autocast context manager when appropriate."""
+    if DEVICE == "cuda":
+        return torch.autocast(device_type="cuda", dtype=DTYPE)
+    return contextlib.nullcontext()
+
+
+def get_generator(seed: int | None):
+    """Build a torch Generator for deterministic outputs."""
+    if seed is None or seed < 0:
+        return None
+    generator = torch.Generator(device=DEVICE)
+    generator.manual_seed(seed)
+    return generator
+
+
+def generate_novel_view(
+    processed_image: Image.Image,
+    azimuth: float,
+    polar: float = 0,
+    num_steps: int = 75,
+    guidance: float = 3.0,
+    seed: int | None = None,
+) -> Image.Image:
     """Generate a novel view at the specified angles."""
     pipe = load_pipeline()
 
@@ -136,27 +208,35 @@ def generate_novel_view(processed_image: Image.Image, azimuth: float, polar: flo
     # azimuth: rotation around vertical axis (left/right)
     pose = [polar, azimuth, 0.0]
 
-    with torch.no_grad():
+    generator = get_generator(seed)
+    with torch.inference_mode(), inference_autocast():
         result = pipe(
             input_imgs=processed_image,
             prompt_imgs=processed_image,
             poses=[pose],
-            height=256,
-            width=256,
+            height=PIPELINE_CONFIG.image_size,
+            width=PIPELINE_CONFIG.image_size,
             num_inference_steps=num_steps,
             guidance_scale=guidance,
+            generator=generator,
         ).images[0]
 
     return result
 
 
-def generate_rotation_set(image: Image.Image, angle: float = 30,
-                          num_steps: int = 75, guidance: float = 3.0):
+def generate_rotation_set(
+    image: Image.Image,
+    angle: float = 30,
+    num_steps: int = 75,
+    guidance: float = 3.0,
+    seed: int | None = None,
+    remove_bg: bool = True,
+):
     """Generate 3 images: +angle, original (0), -angle rotations."""
 
     # Preprocess the image once (removes background)
-    print("Preprocessing image (removing background)...")
-    processed = preprocess_image(image)
+    LOGGER.info("Preprocessing image...")
+    processed = preprocess_image(image, size=PIPELINE_CONFIG.image_size, remove_bg=remove_bg)
 
     pipe = load_pipeline()
 
@@ -168,20 +248,22 @@ def generate_rotation_set(image: Image.Image, angle: float = 30,
         if az == 0:
             # For center image, use the preprocessed version directly
             results.append(processed)
-            print(f"Using original preprocessed image for azimuth=0°")
+            LOGGER.info("Using original preprocessed image for azimuth=0°")
         else:
-            print(f"Generating view at azimuth={az}°...")
+            LOGGER.info("Generating view at azimuth=%s°...", az)
             pose = [0, az, 0.0]  # [polar, azimuth, distance]
+            generator = get_generator(seed + i if seed is not None and seed >= 0 else None)
 
-            with torch.no_grad():
+            with torch.inference_mode(), inference_autocast():
                 result = pipe(
                     input_imgs=processed,
                     prompt_imgs=processed,
                     poses=[pose],
-                    height=256,
-                    width=256,
+                    height=PIPELINE_CONFIG.image_size,
+                    width=PIPELINE_CONFIG.image_size,
                     num_inference_steps=num_steps,
                     guidance_scale=guidance,
+                    generator=generator,
                 ).images[0]
             results.append(result)
 
@@ -210,7 +292,7 @@ def export_images(images: list, output_dir: str, base_name: str = "view"):
         filepath = output_path / filename
         img.save(filepath)
         saved_paths.append(str(filepath))
-        print(f"Saved: {filepath}")
+        LOGGER.info("Saved: %s", filepath)
 
     # Also save the GIF
     gif_path = output_path / f"{base_name}_animation.gif"
@@ -218,7 +300,7 @@ def export_images(images: list, output_dir: str, base_name: str = "view"):
     with open(gif_path, "wb") as f:
         f.write(gif_data)
     saved_paths.append(str(gif_path))
-    print(f"Saved: {gif_path}")
+    LOGGER.info("Saved: %s", gif_path)
 
     return saved_paths
 
@@ -227,7 +309,7 @@ def export_images(images: list, output_dir: str, base_name: str = "view"):
 CURRENT_IMAGES = []
 
 
-def process_image(image, angle, num_steps, guidance):
+def process_image(image, angle, num_steps, guidance, seed, remove_bg):
     """Main processing function for Gradio."""
     global CURRENT_IMAGES
 
@@ -240,7 +322,9 @@ def process_image(image, angle, num_steps, guidance):
             Image.fromarray(image),
             angle=angle,
             num_steps=int(num_steps),
-            guidance=guidance
+            guidance=guidance,
+            seed=int(seed) if seed is not None else None,
+            remove_bg=remove_bg,
         )
 
         CURRENT_IMAGES = images
@@ -254,8 +338,7 @@ def process_image(image, angle, num_steps, guidance):
         return images[0], images[1], images[2], gif_path, "Generation complete!"
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        LOGGER.exception("Generation failed.")
         return None, None, None, None, f"Error: {str(e)}"
 
 
@@ -301,6 +384,14 @@ def create_ui():
                         minimum=1.0, maximum=10.0, value=3.0, step=0.5,
                         label="Guidance Scale"
                     )
+                    seed_slider = gr.Slider(
+                        minimum=-1, maximum=2147483647, value=-1, step=1,
+                        label="Seed (-1 = random)"
+                    )
+                    remove_bg_checkbox = gr.Checkbox(
+                        value=True,
+                        label="Remove Background"
+                    )
 
                 generate_btn = gr.Button("Generate Views", variant="primary")
 
@@ -325,7 +416,7 @@ def create_ui():
         # Connect events
         generate_btn.click(
             fn=process_image,
-            inputs=[input_image, angle_slider, steps_slider, guidance_slider],
+            inputs=[input_image, angle_slider, steps_slider, guidance_slider, seed_slider, remove_bg_checkbox],
             outputs=[img_plus, img_center, img_minus, gif_preview, status]
         )
 
@@ -338,23 +429,43 @@ def create_ui():
     return app
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Zero-1-to-3 Novel View Synthesis")
+    parser.add_argument("--model-id", default=os.getenv("ZERO123_MODEL_ID", DEFAULT_MODEL_ID))
+    parser.add_argument("--device", default=os.getenv("ZERO123_DEVICE"))
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--share", action="store_true")
+    parser.add_argument("--skip-preload", action="store_true", help="Start UI without preloading the model.")
+    parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE, choices=[256, 512])
+    return parser.parse_args()
+
+
 def main():
     """Main entry point."""
-    print("=" * 50)
-    print("Zero-1-to-3 Novel View Synthesis")
-    print("=" * 50)
-    print(f"Device: {DEVICE}")
-    print("Loading model (this may take a moment)...")
-    print("=" * 50)
+    global DEVICE, DTYPE, PIPELINE_CONFIG
+    args = parse_args()
 
-    # Pre-load the pipeline
-    load_pipeline()
+    PIPELINE_CONFIG = AppConfig(model_id=args.model_id, image_size=args.image_size)
+    DEVICE, DTYPE = resolve_device(args.device)
 
-    print("Starting web UI at http://127.0.0.1:7860")
+    LOGGER.info("=" * 50)
+    LOGGER.info("Zero-1-to-3 Novel View Synthesis")
+    LOGGER.info("=" * 50)
+    LOGGER.info("Model: %s", PIPELINE_CONFIG.model_id)
+    LOGGER.info("Device: %s", DEVICE)
+    LOGGER.info("Image size: %s", PIPELINE_CONFIG.image_size)
+    LOGGER.info("=" * 50)
+
+    if not args.skip_preload:
+        LOGGER.info("Loading model (this may take a moment)...")
+        load_pipeline()
+
+    LOGGER.info("Starting web UI at http://%s:%s", args.host, args.port)
 
     # Launch Gradio
     app = create_ui()
-    app.launch(share=False, server_name="127.0.0.1", server_port=7860)
+    app.launch(share=args.share, server_name=args.host, server_port=args.port)
 
 
 if __name__ == "__main__":
